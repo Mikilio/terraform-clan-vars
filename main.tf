@@ -7,30 +7,33 @@ data "external" "valid_machines" {
 }
 
 locals {
-  valid_users_set = length(data.external.valid_users.result["result"]) > 0 ? toset(split(",", data.external.valid_users.result["result"])) : toset([])
+  valid_users_set    = length(data.external.valid_users.result["result"]) > 0 ? toset(split(",", data.external.valid_users.result["result"])) : toset([])
   valid_machines_set = length(data.external.valid_machines.result["result"]) > 0 ? toset(split(",", data.external.valid_machines.result["result"])) : toset([])
 }
 
 resource "terraform_data" "dependency_guard" {
-  count = length(var.vars_to_store) + length(var.secrets_to_store) > 0 ? 1 : 0  # Simplified (maps always >=0, but this works)
+  count = length(var.vars_to_store) + length(var.secrets_to_store) > 0 ? 1 : 0 # Simplified (maps always >=0, but this works)
 
   triggers_replace = {
-    vars_hash = sha256(jsonencode(var.vars_to_store))  # Keep for vars
-    secrets_structure = sha256(jsonencode({ for k, s in var.secrets_to_store : k => { users = s.users, hosts = s.hosts } }))  # Hash only non-sensitive parts
+    vars_hash         = sha256(jsonencode(var.vars_to_store))                                                                # Keep for vars
+    secrets_structure = sha256(jsonencode({ for k, s in var.secrets_to_store : k => { users = s.users, hosts = s.hosts } })) # Hash only non-sensitive parts
   }
 }
 
 resource "null_resource" "store_vars" {
-  for_each = var.vars_to_store
+  for_each = {
+    for var_entry in var.vars_to_store :
+    sha256(jsonencode({ name = var_entry.name, machines = sort(var_entry.machines) })) => var_entry
+  }
 
   triggers = {
-    var_key    = each.key
-    var_value  = each.value.value
-    machines   = join(",", sort(each.value.machines))
+    var_key   = each.value.name
+    var_value = each.value.value
+    machines  = join(",", sort(each.value.machines))
   }
 
   provisioner "local-exec" {
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       set -euo pipefail
 
@@ -40,7 +43,7 @@ resource "null_resource" "store_vars" {
       fi
 
       for machine in ${join(" ", each.value.machines)}; do
-        echo -n "${each.value.value}" | clan vars set "$machine" "terraform/${each.key}"
+        echo -n "${each.value.value}" | clan vars set "$machine" "terraform/${each.value.name}"
       done
     EOT
     interpreter = ["bash", "-c"]
@@ -61,7 +64,7 @@ resource "null_resource" "store_secrets" {
 
   provisioner "local-exec" {
     # Pre-compute flags in HCL to avoid fragile Bash loops and word-splitting issues
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       set -euo pipefail
 
@@ -79,7 +82,7 @@ resource "null_resource" "store_secrets" {
 
 output "clan_summary" {
   value = {
-    vars_deployed   = keys(var.vars_to_store)
+    vars_deployed    = [for var_entry in var.vars_to_store : var_entry.name]
     secrets_deployed = keys(var.secrets_to_store)
   }
 }
