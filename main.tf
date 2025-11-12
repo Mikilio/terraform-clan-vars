@@ -11,13 +11,55 @@ locals {
   valid_machines_set = length(data.external.valid_machines.result["result"]) > 0 ? toset(split(",", data.external.valid_machines.result["result"])) : toset([])
 }
 
-resource "terraform_data" "dependency_guard" {
-  count = length(var.vars_to_store) + length(var.secrets_to_store) > 0 ? 1 : 0 # Simplified (maps always >=0, but this works)
-
-  triggers_replace = {
-    vars_hash         = sha256(jsonencode(var.vars_to_store))                                                                # Keep for vars
-    secrets_structure = sha256(jsonencode({ for k, s in var.secrets_to_store : k => { users = s.users, hosts = s.hosts } })) # Hash only non-sensitive parts
+# Fetch current var hashes from clan
+data "external" "current_var_hashes" {
+  for_each = {
+    for var_entry in var.vars_to_store :
+    sha256(jsonencode({ name = var_entry.name, machines = sort(var_entry.machines) })) => var_entry
   }
+
+  program = ["bash", "-c", <<-EOT
+    set -euo pipefail
+    
+    if [ ${length(each.value.machines)} -eq 0 ]; then
+      echo '{"hash": ""}'
+      exit 0
+    fi
+    
+    # Get hash of all machine values concatenated (in sorted order)
+    hash=""
+    for machine in ${join(" ", sort(each.value.machines))}; do
+      value=$(clan vars get "$machine" "terraform/${each.value.name}" 2>/dev/null || echo "")
+      hash="$hash$value"
+    done
+    
+    if [ -z "$hash" ]; then
+      echo '{"hash": "none"}'
+    else
+      computed_hash=$(echo -n "$hash" | sha256sum | cut -d' ' -f1)
+      echo "{\"hash\": \"$computed_hash\"}"
+    fi
+  EOT
+  ]
+}
+
+# Fetch current secret hashes from clan
+data "external" "current_secret_hashes" {
+  for_each = var.secrets_to_store
+
+  program = ["bash", "-c", <<-EOT
+    set -euo pipefail
+    
+    value=$(clan secrets get "${each.key}" 2>/dev/null || echo "")
+    
+    if [ -z "$value" ]; then
+      echo '{"hash": "none"}'
+    else
+      computed_hash=$(echo -n "$value" | sha256sum | cut -d' ' -f1)
+      echo "{\"hash\": \"$computed_hash\"}"
+    fi
+  EOT
+  ]
 }
 
 resource "null_resource" "store_vars" {
@@ -27,9 +69,10 @@ resource "null_resource" "store_vars" {
   }
 
   triggers = {
-    var_key   = each.value.name
-    var_value = each.value.value
-    machines  = join(",", sort(each.value.machines))
+    var_key      = each.value.name
+    desired_hash = sha256(join("", [for _ in each.value.machines : each.value.value]))
+    current_hash = data.external.current_var_hashes[each.key].result.hash
+    machines     = join(",", sort(each.value.machines))
   }
 
   provisioner "local-exec" {
@@ -42,28 +85,28 @@ resource "null_resource" "store_vars" {
         exit 0
       fi
 
-      for machine in ${join(" ", each.value.machines)}; do
+      for machine in ${join(" ", sort(each.value.machines))}; do
         echo -n "${each.value.value}" | clan vars set "$machine" "terraform/${each.value.name}"
       done
     EOT
     interpreter = ["bash", "-c"]
   }
 
-  depends_on = [data.external.valid_machines, terraform_data.dependency_guard]
+  depends_on = [data.external.valid_machines]
 }
 
 resource "null_resource" "store_secrets" {
   for_each = var.secrets_to_store
 
   triggers = {
-    key   = each.key
-    value = sha256(each.value.value)
-    users = join(",", sort(each.value.users))
-    hosts = join(",", sort(each.value.hosts))
+    key          = each.key
+    desired_hash = sha256(each.value.value)
+    current_hash = data.external.current_secret_hashes[each.key].result.hash
+    users        = join(",", sort(each.value.users))
+    hosts        = join(",", sort(each.value.hosts))
   }
 
   provisioner "local-exec" {
-    # Pre-compute flags in HCL to avoid fragile Bash loops and word-splitting issues
     command     = <<-EOT
       #!/bin/bash
       set -euo pipefail
@@ -77,7 +120,7 @@ resource "null_resource" "store_secrets" {
     interpreter = ["bash", "-c"]
   }
 
-  depends_on = [data.external.valid_users, data.external.valid_machines, terraform_data.dependency_guard]
+  depends_on = [data.external.valid_users, data.external.valid_machines]
 }
 
 output "clan_summary" {
