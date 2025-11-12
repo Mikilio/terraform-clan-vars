@@ -34,6 +34,23 @@ variable "secrets_to_store" {
   }
 }
 
+variable "vars_to_import" {
+  description = "Map of vars to import from Clan. Key is the name to use in outputs, value specifies the clan key path and machine. Example: { my_debug_flag = { key = 'some/arbitrary/key', machine = 'server1' } }."
+  type = map(object({
+    key     = string
+    machine = string
+  }))
+  default = {}
+}
+
+variable "secrets_to_import" {
+  description = "Map of secrets to import from Clan. Key is the name to use in outputs, value specifies the secret key. Example: { my_password = { key = 'vm_root_password' } }."
+  type = map(object({
+    key = string
+  }))
+  default = {}
+}
+
 check "validate_vars_machines" {
   assert {
     condition = alltrue([
@@ -64,6 +81,17 @@ check "validate_secrets_hosts" {
     ])
 
     error_message = "Invalid hosts in secrets_to_store: All hosts must match 'clan secrets machines list'. Found invalid: ${join(", ", flatten([for k, secret in var.secrets_to_store : [for h in secret.hosts : h if !contains(local.valid_machines_set, h)]]))}"
+  }
+}
+
+check "validate_import_vars_machines" {
+  assert {
+    condition = alltrue([
+      for k, var_entry in var.vars_to_import :
+      contains(local.valid_machines_set, var_entry.machine)
+    ])
+
+    error_message = "Invalid machines in vars_to_import: All machines must match output of 'clan secrets machines list'. Found invalid: ${join(", ", [for k, var_entry in var.vars_to_import : var_entry.machine if !contains(local.valid_machines_set, var_entry.machine)])}"
   }
 }
 

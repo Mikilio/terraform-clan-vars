@@ -11,7 +11,6 @@ locals {
   valid_machines_set = length(data.external.valid_machines.result["result"]) > 0 ? toset(split(",", data.external.valid_machines.result["result"])) : toset([])
 }
 
-# Fetch current var hashes from clan
 data "external" "current_var_hashes" {
   for_each = {
     for var_entry in var.vars_to_store :
@@ -43,7 +42,6 @@ data "external" "current_var_hashes" {
   ]
 }
 
-# Fetch current secret hashes from clan
 data "external" "current_secret_hashes" {
   for_each = var.secrets_to_store
 
@@ -58,6 +56,29 @@ data "external" "current_secret_hashes" {
       computed_hash=$(echo -n "$value" | sha256sum | cut -d' ' -f1)
       echo "{\"hash\": \"$computed_hash\"}"
     fi
+  EOT
+  ]
+}
+
+data "external" "import_var" {
+  for_each = var.vars_to_import
+  
+  program = ["bash", "-c", <<-EOT
+    set -euo pipefail
+    value=$(clan vars get "${each.value.machine}" "${each.value.key}" 2>/dev/null || echo "")
+    # Use jq to properly JSON-encode the value
+    jq -n --arg val "$value" '{"value": $val}'
+  EOT
+  ]
+}
+
+data "external" "import_secret" {
+  for_each = var.secrets_to_import
+  
+  program = ["bash", "-c", <<-EOT
+    set -euo pipefail
+    value=$(clan secrets get "${each.value.key}" 2>/dev/null || echo "")
+    jq -n --arg val "$value" '{"value": $val}'
   EOT
   ]
 }
@@ -123,9 +144,29 @@ resource "null_resource" "store_secrets" {
   depends_on = [data.external.valid_users, data.external.valid_machines]
 }
 
+output "imported_vars" {
+  description = "Vars imported from Clan, keyed by the name specified in vars_to_import"
+  value = {
+    for k, v in var.vars_to_import :
+    k => data.external.import_var[k].result.value
+  }
+  sensitive = true
+}
+
+output "imported_secrets" {
+  description = "Secrets imported from Clan, keyed by the name specified in secrets_to_import"
+  value = {
+    for k, v in var.secrets_to_import :
+    k => data.external.import_secret[k].result.value
+  }
+  sensitive = true
+}
+
 output "clan_summary" {
   value = {
-    vars_deployed    = [for var_entry in var.vars_to_store : var_entry.name]
-    secrets_deployed = keys(var.secrets_to_store)
+    vars_deployed      = [for var_entry in var.vars_to_store : var_entry.name]
+    secrets_deployed   = keys(var.secrets_to_store)
+    vars_imported      = keys(var.vars_to_import)
+    secrets_imported   = keys(var.secrets_to_import)
   }
 }
